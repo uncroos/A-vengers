@@ -54,7 +54,7 @@ const uint8_t  OVERSAMPLE = EMG_OUTPUT_ENV ? 4 : 1;
 const uint32_t WINDOW_MS  = 100;                          // 활동도 계산 창 (ENV: 창 평균, RAW: 창 내 AC RMS)
 
 // 판정 기준 (임의 시작값)
-const float SAT_MV        = 3000.0f;   // ADC 11dB 포화는 약 3100mV 부근
+const float SAT_MV        = 2900.0f;   // 실측: 강한 수축 시 ENV가 약 2978mV에서 평탄화됨(ADC 상단)
 const float RAW_CENTER_MV = 1650.0f;   // RAW 출력은 VCC/2 중심으로 알고 있음 (데이터시트 확인 필요)
 const float BASE_PP_OK    = 60.0f;     // [ENV] 이완 시 최대-최소: 이하 OK
 const float BASE_PP_WARN  = 150.0f;    //        이하 WARN
@@ -66,6 +66,14 @@ const float NOISE_FLOOR_MIN = EMG_OUTPUT_ENV ? 10.0f : 5.0f;   // SNR 계산 시
 const float SNR_OK   = 10.0f;
 const float SNR_WARN = 4.0f;
 const float SAT_FRAC_WARN = 0.01f;     // 수축 중 샘플의 1% 이상이 포화면 게인 과다
+
+// 자동 임계값 (이완 중앙값 위로 얼마나 올릴지). 이완 노이즈가 매우 작으므로 증가량의 낮은 비율로 잡는다.
+const float THR_ON_FRAC  = 0.20f;      // ON  = 이완 중앙값 + max(증가량*0.20, 노이즈*4)
+const float THR_OFF_FRAC = 0.10f;      // OFF = 이완 중앙값 + max(증가량*0.10, 노이즈*2.5)
+const float THR_ON_NOISE_MULT  = 4.0f;
+const float THR_OFF_NOISE_MULT = 2.5f;
+const int   ON_WINDOWS  = 2;           // [4] 임계값 이상이 이 창 수(50ms 단위) 연속이면 ON
+const int   OFF_WINDOWS = 2;           //     임계값 이하가 이 창 수 연속이면 OFF
 
 // ============================ 출력 (USB + 블루투스) ============================
 
@@ -345,6 +353,11 @@ void testContraction() {
   sortAsc(tmp, nTail);
   float recov = tmp[nTail / 2];
 
+  int h0 = iB + nB / 2, nH = iC - h0;                  // 수축 구간 후반 절반 (유지 구간)
+  for (int i = 0; i < nH; i++) tmp[i] = g_tl[h0 + i];
+  sortAsc(tmp, nH);
+  float plateau = tmp[nH / 2];
+
   out.printf("\n구간            활동도 대표값(%s)   활동도 최대   신호 mV 최소~최대\n", EMG_OUTPUT_ENV ? "mV" : "RMS mV");
   out.printf("이완(전)  중앙값 %9.1f                  %9.1f     %6.0f ~ %-6.0f\n", baseMed, A.a.mx, A.s.mn, A.s.mx);
   out.printf("수축      최고1초 %8.1f                  %9.1f     %6.0f ~ %-6.0f\n", clenchTop, B.a.mx, B.s.mn, B.s.mx);
@@ -377,6 +390,7 @@ void testContraction() {
 
   r3 = v; r3Delta = delta; r3Snr = snr; r3Sat = satFrac;
   out.printf("\n증가량(수축 최고1초 - 이완 중앙값): %.1f mV   대비(SNR=증가량/이완 변동): %.1f   포화 샘플: %.1f%%\n", delta, snr, 100.0f * satFrac);
+  out.printf("수축 유지 구간(후반 절반) 중앙값: %.1f  (최고1초 대비 %.0f%%)  -- 처음 폭발 이후 유지 시 값이 얼마나 내려오는지\n", plateau, clenchTop > 0 ? 100.0f * plateau / clenchTop : 0);
   out.printf("판정: %s  %s\n", vtxt(v), msg);
   out.printf("기준(임의 시작값): 증가량 %.0f mV 이상 & SNR %.0f 이상 OK, (%.0f mV, SNR %.0f) 이상 WARN\n", DELTA_OK, SNR_OK, DELTA_WEAK, SNR_WARN);
 
@@ -398,10 +412,15 @@ void testContraction() {
   out.println("-> 막대가 높은 구간이 '지금!'~'힘 빼세요' 사이에 있어야 정상입니다.");
 
   if (delta > 0 && v != V_FAIL) {
-    thrOn  = baseMed + 0.5f * delta;
-    thrOff = baseMed + 0.3f * delta;
+    float onGap  = fmaxf(THR_ON_FRAC * delta,  THR_ON_NOISE_MULT * noise);
+    float offGap = fmaxf(THR_OFF_FRAC * delta, THR_OFF_NOISE_MULT * noise);
+    if (offGap >= onGap) offGap = 0.6f * onGap;
+    thrOn  = baseMed + onGap;
+    thrOff = baseMed + offGap;
     haveThr = true;
-    out.printf("자동 임계값: ON %.1f / OFF %.1f (이완 중앙값 + 증가량의 50%% / 30%%) -> [4]에서 사용\n", thrOn, thrOff);
+    out.printf("자동 임계값: ON %.1f / OFF %.1f (이완 중앙값 + 노이즈/증가량 기반 간격) -> [4]에서 사용\n", thrOn, thrOff);
+    if (plateau < thrOn * 1.3f)
+      out.println("주의: 유지 구간 값이 ON 임계값에 가까움. 약하게 쥐는 동작은 놓치거나 깜빡일 수 있음 (THR_ON_FRAC을 낮춰 보세요).");
   } else {
     haveThr = false;
   }
@@ -412,7 +431,7 @@ void testContraction() {
 void testTrigger() {
   header("[4] 트리거 데모 (10초)");
   if (!haveThr) { out.println("먼저 [3] 수축 반응을 실행해 임계값을 계산하세요 (FAIL이면 센서부터 해결)."); return; }
-  out.printf("임계값 ON %.1f / OFF %.1f (히스테리시스)\n", thrOn, thrOff);
+  out.printf("임계값 ON %.1f / OFF %.1f (히스테리시스), %dms 이상 유지 시 ON\n", thrOn, thrOff, ON_WINDOWS * 50);
   out.println("시작 후 첫 1초는 가만히 있다가, 10초 안에 주먹을 3번 쥐었다 펴세요 (쥐고 1초, 펴고 1초 정도).");
   if (!countdown(3)) return;
   out.println(">> 시작! (10초)");
@@ -420,7 +439,7 @@ void testTrigger() {
   const uint32_t WIN_MS = 50;
   uint32_t startUs = micros(), next = startUs, totalUs = 10000000UL;
   ActMeter am; am.begin(startUs, WIN_MS);
-  bool on = false; uint32_t onAtMs = 0; int count = 0, chatter = 0; float sumDur = 0;
+  bool on = false; uint32_t onAtMs = 0; int count = 0, chatter = 0; float sumDur = 0; int aboveN = 0, belowN = 0;
   while ((uint32_t)(micros() - startUs) < totalUs) {
     while ((int32_t)(micros() - next) < 0) {}
     next += SAMPLE_US;
@@ -428,18 +447,23 @@ void testTrigger() {
     if (!am.feed(v, micros(), act)) continue;
     if (pollAbort()) { out.println("중단됨"); return; }
     uint32_t tMs = (micros() - startUs) / 1000UL;
-    if (!on && act >= thrOn) { on = true; onAtMs = tMs; count++; out.printf("  ON   t=%5.2fs  활동도 %.0f\n", tMs / 1000.0f, act); }
-    else if (on && act <= thrOff) {
-      on = false; float dur = (tMs - onAtMs) / 1000.0f; sumDur += dur;
-      if (dur < 0.15f) chatter++;
-      out.printf("  OFF  t=%5.2fs  (지속 %.2fs)\n", tMs / 1000.0f, dur);
+    if (!on) {
+      aboveN = (act >= thrOn) ? aboveN + 1 : 0;
+      if (aboveN >= ON_WINDOWS) { on = true; belowN = 0; onAtMs = tMs; count++; out.printf("  ON   t=%5.2fs  활동도 %.0f\n", tMs / 1000.0f, act); }
+    } else {
+      belowN = (act <= thrOff) ? belowN + 1 : 0;
+      if (belowN >= OFF_WINDOWS) {
+        on = false; aboveN = 0; float dur = (tMs - onAtMs) / 1000.0f; sumDur += dur;
+        if (dur < 0.15f) chatter++;
+        out.printf("  OFF  t=%5.2fs  (지속 %.2fs)\n", tMs / 1000.0f, dur);
+      }
     }
   }
   r4Count = count; r4Chatter = chatter;
   out.printf("\nON 횟수: %d (기대값 3)   0.15초 미만의 짧은 ON: %d회   평균 지속: %.2fs\n", count, chatter, count ? sumDur / count : 0);
   if (count == 3 && chatter == 0) out.println("깔끔하게 3번 감지됨.");
-  else if (count > 3 || chatter > 0) out.println("기대보다 많이 감지됨: 임계값을 올리거나(상수 ON/OFF 간격 확대) 이완 기준선 노이즈를 확인하세요.");
-  else out.println("기대보다 적게 감지됨: 임계값이 높거나 수축이 약했을 수 있음. [3]을 다시 실행해 보세요.");
+  else if (count > 3 || chatter > 0) out.println("기대보다 많이 감지됨: ON_WINDOWS를 늘리거나 THR_ON_FRAC을 올리고, 이완 구간 노이즈를 확인하세요.");
+  else out.println("기대보다 적게 감지됨: THR_ON_FRAC을 낮추거나 더 확실히 쥐어 보세요. 시작 때 이미 쥐고 있었다면 처음 1초는 힘을 빼세요.");
 }
 
 // ============================ [5] 스트림 ============================
