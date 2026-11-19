@@ -11,7 +11,7 @@
  *   검지만 굽힘        -> 다음 슬라이드
  *   중지+약지 굽힘     -> 이전 슬라이드   (검지는 편 채로)
  *   엄지는 두 제스처 모두 무시 (장갑에서 엄지는 끝까지 안 굽혀지는 경우가 많음)
- *   주먹(검지·중지·약지 모두 굽힘)은 어느 제스처에도 해당하지 않음 (나중에 잠금용으로 예약)
+ *   주먹(검지·중지·약지 모두 굽힘)을 쥐면 손이 완전히 펴질 때까지 모든 제스처 차단 (쥐고 펴는 도중 오발동 방지)
  *
  * 처음 쓰는 순서
  *   1) USE_BLE_HID = 0 으로 업로드해서 센서/제스처 로직만 확인 (PC 연결 불필요)
@@ -23,8 +23,8 @@
  * 하드웨어: BOOT 버튼(GPIO0)을 2초 이상 누르면 재캘리브레이션
  *   (GPIO0은 스트랩 핀이므로 부팅이 끝난 뒤 입력으로만 읽음. 외부 회로를 연결하지 말 것)
  *
- * 참고: 디버그 출력은 시리얼 플로터용 "이름:값" 형식이라 [ACTION] 같은 텍스트 줄이 섞이면 플로터에는 안 그려진다.
- *       로그만 보고 싶으면 'd'로 디버그 출력을 끈다.
+ * 참고: 기본은 포즈가 바뀔 때마다 [POSE] 로그를 출력한다 (어떤 손가락이 굽힘으로 판정됐는지, 굽힘값, 매칭된 제스처).
+ *       시리얼 플로터로 보려면 'd'로 플로터 출력을 켜고 'l'로 포즈 로그를 끈다 (텍스트 줄이 섞이면 플로터에 안 그려짐).
  */
 
 #include <Arduino.h>
@@ -39,11 +39,24 @@
   // PC 블루투스 목록에 보이는 이름 / 제조사 / 배터리%. (이름을 바꾸면 PC에서 기기를 제거하고 다시 페어링)
   HijelHID_BLEKeyboard keyboard("Finger Stone", "A+vengers", 100);
 
-  // 슬라이드 넘김 키. 라이브러리 문서에서 확인된 상수만 사용:
-  //   PowerPoint/Google 슬라이드쇼에서 Space = 다음, P = 이전
-  // Page Down / Page Up 으로 바꾸려면 라이브러리의 src/BLEHIDKeys.h 에서 상수 이름을 확인해 여기만 고치면 됨
-  #define SLIDE_NEXT_KEY KEY_SPACE
-  #define SLIDE_PREV_KEY KEY_P
+  // 슬라이드 넘김 키 설정.
+  // 라이브러리 문서에서 이름이 확인된 상수는 KEY_SPACE, KEY_RETURN, KEY_ESCAPE, KEY_A~KEY_Z 등이고
+  // 화살표/PageUp/PageDown 상수 이름은 src/BLEHIDKeys.h 를 봐야 알 수 있다 (아직 미확인).
+  //
+  // USE_RAW_HID_CODES = 0 : 확인된 상수만 사용 (Space=다음, P=이전). 이전 슬라이드가 안 먹을 수 있음
+  // USE_RAW_HID_CODES = 1 : USB HID 키 코드 숫자를 직접 전달 (실험용).
+  //     KEY_A 등이 표준 USB HID 코드(KEY_A=0x04, KEY_SPACE=0x2C)와 같은 값일 때만 동작.
+  //     컴파일 오류가 나거나 엉뚱한 키가 나가면 0으로 되돌리고 BLEHIDKeys.h 의 ARROW/PAGE 줄을 확인할 것
+  #define USE_RAW_HID_CODES 0
+
+  #if USE_RAW_HID_CODES
+    // PowerPoint 슬라이드쇼: 아래 화살표 = 다음 슬라이드, 위 화살표 = 이전 슬라이드
+    #define SLIDE_NEXT_KEY 0x51   // HID Down Arrow
+    #define SLIDE_PREV_KEY 0x52   // HID Up Arrow
+  #else
+    #define SLIDE_NEXT_KEY KEY_SPACE
+    #define SLIDE_PREV_KEY KEY_P
+  #endif
 #endif
 
 // 핀 (README 핀맵 기준: 엄지, 검지, 중지, 약지 / 모두 ADC1). 새끼 채널(GPIO32)은 센서 고장으로 사용하지 않음
@@ -70,6 +83,8 @@ const float BENT_OFF[NUM_FINGERS] = {0.40f, 0.35f, 0.35f, 0.35f};
 // 제스처 확정
 const uint32_t DEBOUNCE_MS = 120;          // 같은 포즈가 이 시간 이상 유지돼야 인정
 const uint32_t REFRACTORY_MS = 400;        // 제스처 발동 후 이 시간 동안은 다음 제스처 발동 안 함
+// 제스처에서 "펴져 있어야 하는" 손가락은 굽힘값이 이 값 이하로 확실히 펴져 있어야 인정 (전환 중 오발동 방지)
+const float    OPEN_CLEAR = 0.30f;
 
 // ============================ 제스처 정의 ============================
 
@@ -96,8 +111,8 @@ const uint8_t B_NO_THUMB = B_ALL & ~B_THUMB;
 // 위에서부터 먼저 일치하는 항목이 선택됨. 팀에서 여기만 고치면 제스처가 바뀜.
 const Gesture GESTURES[] = {
   // 이름          굽힌 손가락              비교 손가락    액션       hold
-  {"INDEX_BEND", B_INDEX,                B_NO_THUMB,  ACT_NEXT,  80},
-  {"RING_MID",   (uint8_t)(B_MIDDLE|B_RING), B_NO_THUMB, ACT_PREV,  80},
+  {"INDEX_BEND", B_INDEX,                B_NO_THUMB,  ACT_NEXT,  250},
+  {"RING_MID",   (uint8_t)(B_MIDDLE|B_RING), B_NO_THUMB, ACT_PREV,  250},
 };
 const uint8_t NUM_GESTURES = sizeof(GESTURES) / sizeof(GESTURES[0]);
 
@@ -117,7 +132,8 @@ float    mvFilt[NUM_FINGERS];
 bool     filtInit = false;
 float    bend[NUM_FINGERS];     // 0(폄) ~ 1(굽힘)
 uint8_t  bentState = 0;         // 히스테리시스를 거친 4비트 포즈
-bool     debugPrint = true;
+bool     debugPrint = false;    // 시리얼 플로터용 출력 (켜려면 'd'). 기본은 꺼 둠: 포즈 로그를 읽기 쉽게
+bool     poseLog = true;        // 포즈 변경 로그 (끄려면 'l')
 uint32_t lastSampleMs = 0;
 uint32_t lastDebugMs = 0;
 
@@ -126,6 +142,7 @@ int8_t   candIdx = -1;  uint32_t candSince = 0;   // 후보(디바운스 중)
 int8_t   curIdx  = -1;  uint32_t curSince  = 0;   // 확정된 제스처
 bool     fired = false; uint32_t lastFireMs = 0;
 bool     everFired = false;
+bool     fistLatch = false;     // 주먹 감지 후 손이 완전히 펴질 때까지 모든 제스처 차단
 
 // ============================ 센서 읽기 ============================
 
@@ -235,13 +252,27 @@ int8_t matchGesture(uint8_t pose) {
   for (uint8_t g = 0; g < NUM_GESTURES; g++) {
     uint8_t care = GESTURES[g].care & validMask;   // 이상 있는 손가락은 비교에서 제외
     if (care == 0) continue;                       // 비교할 손가락이 하나도 없으면 오발동 방지로 건너뜀
-    if ((pose & care) == (GESTURES[g].bent & care)) return g;
+    if ((pose & care) != (GESTURES[g].bent & care)) continue;
+    // 펴져 있어야 하는 손가락이 굽히는 중(애매한 구간)이면 인정하지 않음
+    bool clearlyOpen = true;
+    for (uint8_t i = 0; i < NUM_FINGERS; i++) {
+      uint8_t bit = 1 << i;
+      if ((care & bit) && !(GESTURES[g].bent & bit) && bend[i] > OPEN_CLEAR) clearlyOpen = false;
+    }
+    if (clearlyOpen) return g;
   }
   return -1;
 }
 
 void runGestureEngine(uint32_t now) {
-  int8_t m = matchGesture(bentState);
+  // 주먹(검지·중지·약지 모두 굽힘)이 되면 손이 완전히 펴질 때까지 모든 제스처를 차단.
+  // 주먹을 쥐거나 펴는 도중에 손가락이 하나씩 굽혀/펴지며 생기는 중간 포즈의 오발동을 막는다.
+  const uint8_t FIST_MASK = (B_INDEX | B_MIDDLE | B_RING) & validMask;
+  if (FIST_MASK) {
+    if ((bentState & FIST_MASK) == FIST_MASK) fistLatch = true;
+    else if ((bentState & FIST_MASK) == 0)    fistLatch = false;
+  }
+  int8_t m = fistLatch ? -1 : matchGesture(bentState);
 
   // 디바운스: 같은 후보가 DEBOUNCE_MS 유지되면 확정
   if (m != candIdx) { candIdx = m; candSince = now; }
@@ -251,6 +282,7 @@ void runGestureEngine(uint32_t now) {
     fired = false;
   }
   if (curIdx < 0 || fired) return;
+  if (candIdx != curIdx) return;   // 포즈가 이미 바뀌었으면(주먹으로 가는 중 등) 대기 중이던 제스처는 취소
 
   const Gesture& g = GESTURES[curIdx];
   if (now - curSince < g.holdMs) return;
@@ -272,8 +304,21 @@ void printDebug(uint32_t now) {
   Serial.printf("gesture:%d\n", curIdx + 1);
 }
 
+// 포즈가 바뀔 때마다 한 줄 출력: 어떤 손가락이 굽힘으로 판정됐는지, 그때의 굽힘값, 매칭된 제스처
+void logPoseChange() {
+  static uint8_t lastPose = 0xFF;
+  if (!poseLog || bentState == lastPose) return;
+  lastPose = bentState;
+  Serial.printf("[POSE] ");
+  for (uint8_t i = 0; i < NUM_FINGERS; i++)
+    Serial.printf("%s=%d(%.2f)%s ", FINGER_NAMES[i], (bentState >> i) & 1, bend[i], (validMask & (1 << i)) ? "" : "[무시됨]");
+  int8_t m = matchGesture(bentState);
+  if (fistLatch) Serial.println("-> 주먹: 손이 펴질 때까지 모든 제스처 차단");
+  else Serial.printf("-> %s\n", m < 0 ? "일치하는 제스처 없음" : GESTURES[m].name);
+}
+
 void printHelp() {
-  Serial.println("명령: c=캘리브레이션  d=디버그 출력 토글  p=캘리브레이션 값  h=도움말");
+  Serial.println("명령: c=캘리브레이션  d=플로터 출력 토글  l=포즈 로그 토글  p=캘리브레이션 값  h=도움말");
 }
 
 void handleSerial() {
@@ -281,6 +326,7 @@ void handleSerial() {
     char c = Serial.read();
     if (c == 'c') runCalibration();
     else if (c == 'd') { debugPrint = !debugPrint; Serial.printf("[DBG] %s\n", debugPrint ? "ON" : "OFF"); }
+    else if (c == 'l') { poseLog = !poseLog; Serial.printf("[LOG] 포즈 로그 %s\n", poseLog ? "ON" : "OFF"); }
     else if (c == 'p') applyCalibration();
     else if (c == 'h') printHelp();
   }
@@ -341,5 +387,6 @@ void loop() {
   computeBend();
   updateBentState();
   runGestureEngine(now);
+  logPoseChange();
   printDebug(now);
 }
