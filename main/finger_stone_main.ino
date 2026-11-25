@@ -7,6 +7,9 @@
  *   주먹(검지·중지·약지 굽힘, 엄지는 무시) 0.5초 유지 -> 잠금 켜기/끄기
  *   엄지만 굽힘                                      -> 좌클릭
  *   검지만 굽힘                                      -> 우클릭
+ *   중지만 굽힘                                      -> 다음 슬라이드 (마우스 휠 아래)
+ *   엄지+중지 굽힘                                   -> 이전 슬라이드 (마우스 휠 위)
+ *   (슬라이드 쇼 화면에서 휠이 슬라이드를 넘기므로 키보드 없이 마우스만으로 동작)
  *   잠금 중에는 클릭과 커서 이동이 모두 멈춘다 (주먹으로만 해제).
  *   주먹을 쥐면 손이 완전히 펴질 때까지 다른 제스처를 차단 (쥐고 펴는 도중 오발동 방지)
  *
@@ -20,7 +23,7 @@
  *   Flex : c=Flex 재캘리브레이션  d=플로터 출력  l=포즈 로그  p=캘리브레이션 값
  *   커서 : e=이동 on/off  x=좌우 반전  y=상하 반전  s=상하 축 gy<->gx  +/-=감도  a/q=가속 강/약
  *          k=클러치 on/off  z=자이로 영점  v=이동 로그  r=커서 설정 초기화  h=도움말
- * BOOT 버튼 2초 이상: Flex 재캘리브레이션 (GPIO0은 부팅 후 입력으로만 읽음)
+ * BOOT 버튼: 짧게 누름 = 잠금 토글(비상용), 2초 이상 = Flex 재캘리브레이션
  *
  * 처음 쓰는 순서: 이전 flex4 스케치로 Flex 보정을 한 적이 있으면 그 값을 그대로 사용한다(같은 저장소).
  *   없으면 부팅 때 자동으로 캘리브레이션(손 펴기 -> 주먹)이 시작된다.
@@ -56,8 +59,8 @@ const float    EMA_ALPHA          = 0.30f;
 const uint32_t CAL_SETTLE_MS  = 2000;
 const uint32_t CAL_CAPTURE_MS = 2000;
 const uint16_t MIN_RANGE_MV   = 150;
-const float BENT_ON[NUM_FINGERS]   = {0.60f, 0.55f, 0.55f, 0.55f};
-const float BENT_OFF[NUM_FINGERS]  = {0.40f, 0.35f, 0.35f, 0.35f};
+const float BENT_ON[NUM_FINGERS]   = {0.60f, 0.55f, 0.45f, 0.45f};   // 중지/약지는 주먹이 덜 쥐어져도 인식
+const float BENT_OFF[NUM_FINGERS]  = {0.40f, 0.35f, 0.30f, 0.30f};
 const float OPEN_CLEAR[NUM_FINGERS] = {0.40f, 0.30f, 0.30f, 0.30f};
 
 // ---- 제스처 확정 ----
@@ -91,8 +94,8 @@ const uint8_t B_RING   = 1 << 3;
 const uint8_t B_ALL    = 0x0F;
 const uint8_t B_FIST3  = B_INDEX | B_MIDDLE | B_RING;   // 주먹 판정에 쓰는 손가락 (엄지 제외)
 
-enum Action : uint8_t { ACT_NONE, ACT_LEFT_CLICK, ACT_RIGHT_CLICK, ACT_LOCK_TOGGLE };
-const char* const ACTION_NAMES[] = {"NONE", "LEFT_CLICK", "RIGHT_CLICK", "LOCK_TOGGLE"};
+enum Action : uint8_t { ACT_NONE, ACT_LEFT_CLICK, ACT_RIGHT_CLICK, ACT_LOCK_TOGGLE, ACT_NEXT, ACT_PREV };
+const char* const ACTION_NAMES[] = {"NONE", "LEFT_CLICK", "RIGHT_CLICK", "LOCK_TOGGLE", "NEXT_SLIDE", "PREV_SLIDE"};
 
 struct Gesture {
   const char* name;
@@ -108,6 +111,8 @@ const Gesture GESTURES[] = {
   {"FIST",   B_FIST3,    B_FIST3,    ACT_LOCK_TOGGLE,  500},
   {"THUMB",  B_THUMB,    B_ALL,      ACT_LEFT_CLICK,   250},
   {"INDEX",  B_INDEX,    B_ALL,      ACT_RIGHT_CLICK,  250},
+  {"THUMB_MIDDLE", (uint8_t)(B_THUMB|B_MIDDLE), B_ALL, ACT_PREV, 250},   // 이전 슬라이드
+  {"MIDDLE", B_MIDDLE,   B_ALL,      ACT_NEXT,         250},             // 다음 슬라이드
 };
 const uint8_t NUM_GESTURES = sizeof(GESTURES) / sizeof(GESTURES[0]);
 
@@ -310,6 +315,8 @@ void sendAction(Action a) {
   switch (a) {
     case ACT_LEFT_CLICK:  mouse.click(MouseButton::Left);  break;
     case ACT_RIGHT_CLICK: mouse.click(MouseButton::Right); break;
+    case ACT_NEXT:        mouse.scroll(-1); break;   // 휠 아래 = 다음 슬라이드 (반대면 +1/-1 맞바꾸기)
+    case ACT_PREV:        mouse.scroll(1);  break;   // 휠 위 = 이전 슬라이드
     default: break;
   }
 #endif
@@ -341,8 +348,10 @@ int8_t matchGesture(uint8_t pose) {
 void runGestureEngine(uint32_t now) {
   const uint8_t FIST_MASK = B_FIST3 & validMask;
   if (FIST_MASK) {
+    // 래치 해제는 중지/약지만 본다 (검지는 클릭용이라 계속 굽혀 있거나 센서가 고정돼도 래치가 안 풀리는 문제 방지)
+    const uint8_t RELEASE_MASK = (B_MIDDLE | B_RING) & validMask;
     if ((bentState & FIST_MASK) == FIST_MASK) fistLatch = true;
-    else if ((bentState & FIST_MASK) == 0)    fistLatch = false;
+    else if ((bentState & RELEASE_MASK) == 0) fistLatch = false;
   }
   int8_t m = matchGesture(bentState);
   if (fistLatch && m >= 0 && GESTURES[m].action != ACT_LOCK_TOGGLE) m = -1;
@@ -502,7 +511,7 @@ void stepMouse(float dt) {
     lastFrozenClutch = clutchActive;
     Serial.println(clutchActive ? "[CLUTCH] 정지 (손목을 돌려놓으세요)" : "[CLUTCH] 해제");
   }
-  bool clickPose = FREEZE_ON_CLICK_POSE && ((bentState & (B_THUMB | B_INDEX) & validMask) != 0);
+  bool clickPose = FREEZE_ON_CLICK_POSE && ((bentState & (B_THUMB | B_INDEX | B_MIDDLE) & validMask) != 0);
   bool frozen = locked || !enabledMove || clutchActive || clickPose;
 
   if (frozen) {
@@ -594,14 +603,20 @@ void handleSerial() {
 
 void handleButton() {
   static uint32_t pressedSince = 0;
+  static bool calDone = false;
   if (digitalRead(CAL_BUTTON_PIN) == LOW) {
-    if (!pressedSince) pressedSince = millis();
-    else if (millis() - pressedSince >= 2000) {
-      pressedSince = 0;
+    if (!pressedSince) { pressedSince = millis(); calDone = false; }
+    else if (!calDone && millis() - pressedSince >= 2000) {
+      calDone = true;
       runCalibration();
       while (digitalRead(CAL_BUTTON_PIN) == LOW) delay(10);
     }
   } else {
+    // 짧게(0.05~1초) 눌렀다 떼면 잠금 토글 (제스처가 안 먹을 때 비상용)
+    if (pressedSince && !calDone) {
+      uint32_t d = millis() - pressedSince;
+      if (d >= 50 && d < 1000) setLocked(!locked);
+    }
     pressedSince = 0;
   }
 }
