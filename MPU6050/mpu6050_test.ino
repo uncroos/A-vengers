@@ -11,6 +11,9 @@ const uint32_t I2C_HZ = 400000;
 const uint8_t REG_WHO = 0x75, REG_PWR = 0x6B, REG_CFG = 0x1A,
               REG_GYRO_CFG = 0x1B, REG_ACC_CFG = 0x1C, REG_DATA = 0x3B;
 
+// Arduino가 함수 선언을 자동 생성하므로, 구조체는 첫 함수보다 앞에 둬야 한다
+struct Sample { float ax, ay, az, gx, gy, gz, tc; };
+
 uint8_t addr = 0x68;
 bool ready = false;
 bool plotter = false;
@@ -90,8 +93,6 @@ bool initMpu() {
   Serial.println(F("[MPU] 초기화 완료 (가속도 ±4g, 자이로 ±500dps)"));
   return true;
 }
-
-struct Sample { float ax, ay, az, gx, gy, gz, tc; };
 
 bool readSample(Sample &s) {
   uint8_t b[14];
